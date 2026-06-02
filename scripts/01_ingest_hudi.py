@@ -3,19 +3,17 @@ import shutil
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import col, current_timestamp
 
-# ── paths ─────────────────────────────────────────────────────────────────────
 BASE_DIR   = os.path.expanduser("~/Desktop/lance-hudi")
 JAR_PATH   = f"{BASE_DIR}/jars/hudi-spark3.5-bundle_2.12-1.0.2.jar"
 CSV_PATH   = f"{BASE_DIR}/data/winemag-data-130k-v2.csv"
 HUDI_PATH  = f"{BASE_DIR}/hudi_table/wine_reviews"
 TABLE_NAME = "wine_reviews"
 
-# ── clean any prior table so there is no schema history to evolve against ─────
+# drop stale table to avoid schema conflicts on re-run
 if os.path.exists(HUDI_PATH):
     shutil.rmtree(HUDI_PATH)
     print(f"removed existing table at {HUDI_PATH}")
 
-# ── spark session ─────────────────────────────────────────────────────────────
 spark = (
     SparkSession.builder
     .appName("lance-hudi-ingest")
@@ -30,11 +28,10 @@ spark = (
 
 spark.sparkContext.setLogLevel("WARN")
 
-# ── read csv ──────────────────────────────────────────────────────────────────
 raw = spark.read.csv(CSV_PATH, header=True, inferSchema=True)
 
-# ── select ONLY the columns we use, cast explicitly ──────────────────────────
-# this avoids schema drift from messy columns like winery/taster_name
+# select only the columns we need and cast explicitly;
+# avoids schema drift from messy columns like winery/taster_name
 df = (
     raw
     .withColumnRenamed("_c0", "wine_id")
@@ -53,9 +50,7 @@ df = (
 )
 
 print(f"total records: {df.count()}")
-df.printSchema()
 
-# ── hudi write options ────────────────────────────────────────────────────────
 hudi_options = {
     "hoodie.table.name":                               TABLE_NAME,
     "hoodie.datasource.write.table.type":              "COPY_ON_WRITE",
@@ -63,7 +58,7 @@ hudi_options = {
     "hoodie.datasource.write.recordkey.field":         "wine_id",
     "hoodie.datasource.write.precombine.field":        "ts",
     "hoodie.datasource.write.partitionpath.field":     "country",
-    "hoodie.datasource.write.hive_style_partitioning":  "true",
+    "hoodie.datasource.write.hive_style_partitioning": "true",
     "hoodie.insert.shuffle.parallelism":               "2",
     "hoodie.upsert.shuffle.parallelism":               "2",
 }
@@ -78,9 +73,7 @@ hudi_options = {
 
 print(f"hudi table written to {HUDI_PATH}")
 
-# ── verify ────────────────────────────────────────────────────────────────────
 verify_df = spark.read.format("hudi").load(HUDI_PATH)
 print(f"rows written: {verify_df.count()}")
-verify_df.select("wine_id", "country", "variety", "points", "price", "description").show(5, truncate=80)
 
 spark.stop()
