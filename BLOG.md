@@ -1,237 +1,92 @@
-# One Row Changed in Hudi. The Vector Index Resynced Itself.
-
-Apache Hudi holds the records and LanceDB holds the embeddings. When a wine's description changes in Hudi, the embedding sitting in LanceDB is now stale, and every semantic search against it returns answers built on data that no longer exists. The usual fix is to re-embed the whole table and rebuild the index from scratch. This project takes a different path: it detects the one row that changed and re-embeds only that row.
-
+---
+title: "One Row Changed in Hudi. The Vector Index Resynced Itself."
+date: 2026-06-02
+description: "A working POC that keeps a LanceDB vector index in sync with a mutable Apache Hudi table using incremental queries. No full rebuilds, no full table scans."
+tags: ["Apache Hudi", "LanceDB", "vector-search", "data-engineering", "CDC"]
 ---
 
-## Contents
+## Introduction
 
-- [The problem worth solving](#the-problem-worth-solving)
-- [Architecture](#architecture)
-- [Why Hudi](#why-hudi)
-- [The stack](#the-stack)
-- [How the sync works](#how-the-sync-works)
-- [The demo](#the-demo)
-- [What's next](#whats-next)
-- [What this is not](#what-this-is-not)
+When working with large scale data pipelines, a common challenge is managing downstream consumers when the source table mutates. For structured queries, Apache Hudi provides an elegant solution. Hudi supports incremental reads out of the box, allowing downstream systems to pull only the changes and stay in sync without rescanning the entire table. The mechanism is robust and highly efficient.
 
----
+However, the situation becomes more complex with vector indices. 
+
+When building a semantic search system on top of a mutable table, the embeddings typically reside in a separate vector store like LanceDB. The moment a record changes in the source table, the corresponding embedding in the vector store becomes stale. Search results end up being served based on text that no longer exists. Many architectures deal with this by scheduling a nightly full rebuild. This works fine until the table grows large enough that re-embedding everything stops being practical.
+
+This project demonstrates a simpler, more efficient approach: leveraging Hudi's incremental queries to detect precisely which rows changed, and re-embedding just those specific rows in LanceDB.
+
+The full code is available on [GitHub](https://github.com/Pavan-249/lance-hudi), and this post explains the architecture, the implementation, and key technical takeaways.
 
 ## The problem worth solving
 
-A vector index is a derived artifact. You build it once from a source table, and from then on it stays correct only as long as the source holds still. Real tables do not hold still. A description gets corrected, a record gets updated, and the embedding that represented the old text is now pointing at something that changed underneath it.
+A vector index is fundamentally a derived artifact. It is built from a source table and remains correct only as long as the source data does not change. In real world scenarios, tables change all the time. Descriptions get corrected, records get updated, and the embedding generated from the old text ends up pointing at a moving target.
 
-The common way to deal with this is a nightly full rebuild: read every row, embed every description, and write a fresh index over the top. That is fine when the table is small, but it stops making sense as the data grows. Re-embedding a hundred million descriptions every night to fix the dozen that actually changed is a lot of compute spent on rows that never moved.
+The standard industry practice is often a nightly full rebuild, reading every single row to write a completely fresh index. This is perfectly fine for small tables. However, consider a scenario with a hundred million rows where only a dozen records change overnight. Spending compute power to re-embed rows that never moved is wasteful and creates a real bottleneck at scale.
 
-The question worth asking is narrower. When a single row changes, can you update just that row in the index and leave the rest untouched? On a Hudi table you can, and the rest of this post is how.
+The objective here is narrower: when a single row changes, the system should ideally update just that one row in the index and leave everything else untouched. On an Apache Hudi table, this is remarkably straightforward because Hudi meticulously tracks exactly what changed and when. The rest of this post outlines how this synchronization can be achieved.
 
 ## Architecture
 
-The setup has two stores with a clear hierarchy between them. Hudi is the source of truth, LanceDB is an index derived from it, and a sync script is what keeps the derived copy honest.
+The setup has two stores with a clear hierarchy. Apache Hudi serves as the source of truth, LanceDB acts as a derived index built from it, and a Python sync script (`03_demo_sync.py`) keeps the two in agreement.
 
-[ Lucidchart: Diagram 1 — see assets section ]
+![Architecture: Hudi as source of truth, LanceDB as derived index, connected by 03_demo_sync.py](/images/blog/lance-hudi-arch.png)
 
-On the Hudi side you have the structured fields: country, variety, points, price, and the raw description text. On the LanceDB side you have a 384-dim embedding of each description, stored next to a copy of those same fields so you can filter and search in one query. Nothing connects the two stores except the sync, which runs after a write, pulls back whatever changed, and patches the index in place.
+On the Hudi side, the table contains structured fields like country, variety, points, price, alongside the raw description text. On the LanceDB side, there is a 384-dimensional embedding of each description, stored with copies of those same structured fields to allow filtering and searching in a single query. The only component connecting these two stores is the sync script. It runs after a write happens in Hudi, pulls back the exact changes, and patches the index in place.
 
-The data itself is the Kaggle wine reviews set, 130k records, where each wine carries a handful of structured columns and one block of free-text description. That description is the part that gets embedded, and it is also the field most likely to be edited or corrected later, which makes it a natural place to test what happens when the source drifts.
+The Kaggle wine reviews dataset is used for this demonstration, containing roughly 130,000 records. Each wine record has structured columns and one block of free-text description. That description column is embedded, and since it is also the field most likely to be edited or corrected, it serves as a good test case.
 
 ## Why Hudi
 
-Hudi is built around change data capture, and that is the property this project leans on. Every write lands on the table's timeline as a commit stamped with a monotonic timestamp. Ask Hudi for an incremental query from a given commit and it hands back only the records written after that point, nothing else. There is no diffing step, no separate change-tracking table to maintain, and no full scan to figure out what moved, because Hudi already recorded exactly that when the write happened.
+This is where the architecture really shines. Apache Hudi is built around change data capture, and this capability makes the entire workflow seamless.
 
-[ Lucidchart: Diagram 2 — Hudi commit timeline, see assets section ]
+Every write to a Hudi table lands on the table's timeline as a commit, stamped with a monotonic timestamp. A system can simply query Hudi for incremental changes starting from a given commit, and Hudi will reliably return only the records written after that point. There is no diffing step needed, no separate change-tracking table to maintain, and no full scan required to figure out what moved. Hudi inherently records all of this during the write process.
 
-[ carbon.sh: Snippet A — see assets section ]
+![Hudi commit timeline showing checkpoint and incremental query window](/images/blog/lance-hudi-timeline.png)
 
-This is what keeps the index cheap to maintain. The sync only ever re-embeds the rows that actually changed, so the cost scales with the size of the change rather than the size of the table. On 130k wine reviews that distinction barely registers, but on a table with a hundred million rows it is the line between a sync you can run continuously and one you cannot run at all.
+![Snippet showing incremental query](/images/blog/lance-hudi-code1.png)
+
+This is what makes the index exceptionally cheap to maintain. The sync only ever re-embeds the rows that actually changed. The cost scales proportionally with the size of the change rather than the size of the table. On a dataset of 130k records, that distinction is barely noticeable, but on a table with a hundred million rows, it is the difference between a sync you can run continuously and one you simply cannot afford to run at all.
 
 ## The stack
 
-The write path runs on PySpark 3.5 against a Hudi 1.0.2 copy-on-write table. LanceDB is the vector store, embeddings come from sentence-transformers running all-MiniLM-L6-v2 at 384 dimensions, and PyArrow handles moving the data into LanceDB with explicit column types. Three scripts run in order.
+The write path runs on PySpark 3.5 against a Hudi 1.0.2 copy-on-write table. LanceDB serves as the vector store. Embeddings are generated using `sentence-transformers` with the `all-MiniLM-L6-v2` model at 384 dimensions, and PyArrow handles moving data into LanceDB with explicit column types. The workflow executes as three scripts in sequence.
 
-The first reads the wine reviews CSV and writes all 130k records into the Hudi table. The second reads that Hudi snapshot back, embeds every description, and loads the vectors into LanceDB. The third is the demo: it changes one record in Hudi, detects the change through an incremental query, resyncs LanceDB, and confirms the result with a semantic search.
+The first script (`01_ingest_hudi.py`) reads the wine reviews CSV and writes all records into the Hudi table. The second (`02_build_lance.py`) reads that Hudi snapshot, embeds every description, and loads the vectors into LanceDB. The third (`03_demo_sync.py`) is the actual demo: it updates one record in Hudi, detects the change through an incremental query, resyncs LanceDB, and confirms the result with a semantic search.
 
 ## How the sync works
 
-The mechanism is a short loop. Hudi stamps every write with a commit timestamp, and the sync holds onto a checkpoint, which is just the last commit it managed to process. On each run it asks Hudi for everything committed after that checkpoint, re-embeds the descriptions on whatever comes back, and then updates LanceDB one record at a time before saving the new commit timestamp as the next checkpoint. The following run starts from there, so no commit is ever processed twice and nothing in between is missed.
+The mechanism is straightforward. Hudi stamps every write with a commit timestamp. The sync script maintains a checkpoint, which is simply the last commit timestamp it managed to process. On each run, it queries Hudi for everything committed after that checkpoint, re-embeds the descriptions for whatever rows are returned, and then updates LanceDB one record at a time. After that, it saves the new commit timestamp as the next checkpoint. The following run starts from there, ensuring no commit is ever processed twice and nothing gets missed.
 
-The update itself is a delete followed by an insert, which is a constraint LanceDB imposes rather than a choice I made. There is no in-place vector update, so the only way to replace an embedding is to remove the old row by its id and add the new one in its place.
+The actual update in LanceDB requires a delete followed by an insert. This is a current constraint of LanceDB. Since there is no in-place vector update API, the only way to replace an embedding is to remove the old row by its ID and then add the new one.
 
-[ carbon.sh: Snippet B — see assets section ]
+![Snippet showing the resync code](/images/blog/lance-hudi-code2.png)
 
 ## The demo
 
-The demo takes wine_0, rewrites its description from a bold red to a crisp white, and then checks whether the index noticed. The terminal output walks through the whole thing.
+The demo targets a record `wine_0`, rewrites its description from a bold red wine to a crisp white wine, and then verifies whether the index successfully noticed the change. Here is the terminal output of the process:
 
-[ carbon.sh: Snippet C — see assets section ]
+![Demo terminal output showing the sync in action](/images/blog/lance-hudi-demo.png)
 
-The incremental pull returns one modified record and runs zero full table scans to find it. The stale vector gets deleted, the fresh one goes in, and a search for "crisp white wine green apple lemon zest mineral" comes back with wine_0 at the top and a low distance score. The index ended up consistent with Hudi without ever being rebuilt.
+The incremental pull returns exactly one modified record and executes zero full table scans to find it. The stale vector gets deleted, the fresh embedding is inserted, and a subsequent search for "crisp white wine green apple lemon zest mineral" returns `wine_0` at the top with a low distance score. The index finishes completely consistent with Hudi, without ever needing a full rebuild.
 
-## What's next
+## What is next
 
-This whole architecture is a bridge, and I want to be upfront about that. The only reason a sync script exists is that the vectors live in a store separate from the table they describe, and two RFCs in the Apache Hudi project are aimed squarely at closing that gap. [RFC-100](https://github.com/apache/hudi/issues/14127) adds Lance as a first-class file format inside Hudi, so vectors can sit in the same table as the structured fields, and [RFC-102](https://github.com/apache/hudi/issues/14219) adds native vector similarity search directly on Hudi tables.
+It is worth noting that this two-store architecture is essentially a bridge. The primary reason a sync script needs to exist is that the vectors live in a separate store from the table they describe. Two upcoming RFCs in the Apache Hudi project are aimed directly at closing that gap.
 
-[ Lucidchart: Diagram 3 — see assets section ]
+[RFC-100](https://github.com/apache/hudi/issues/14127) introduces Lance as a first-class file format inside Hudi, allowing vectors to sit directly in the same table as structured fields. [RFC-102](https://github.com/apache/hudi/issues/14219) adds native vector similarity search directly on Hudi tables.
 
-Once both of those land, the second store stops being necessary. The CSV still ingests into Hudi, but the descriptions get embedded into a vector column on the same table, and search runs against Hudi directly instead of a downstream copy. The incremental-pull, delete, re-insert loop has nothing left to do at that point. The sync script was only ever a stand-in for a capability Hudi is in the process of growing, and when that capability ships, the cleanest version of this project is the one where you delete the script.
+![Future state: RFC-100 + RFC-102 collapse Hudi and LanceDB into a single store](/images/blog/lance-hudi-future.png)
+
+Once both capabilities land, the secondary store will stop being necessary altogether. Data will ingest into Hudi, descriptions will be embedded into a vector column on the same table, and semantic search will run against Hudi directly instead of going through a downstream copy. At that point, the entire sync loop will have nothing left to do. The sync script is a stand-in for a capability that Hudi is actively developing, and when it ships, the cleanest version of this project is the one where the script is deleted entirely.
 
 ## What this is not
 
-This is not a daemon. Each run processes one batch of changes and then exits, so the demo is really showing a single tick of what would otherwise be a continuous loop. A production version would poll the timeline on an interval and keep the checkpoint in durable storage rather than in memory.
+A few points are worth clarifying regarding the scope of this project.
 
-It is also not Spark-free, and that part is not by choice. Hudi 1.0 writes a version 8 table, while hudi-rs and Daft both top out at table version 6, which leaves PySpark as the only option for every write. I went looking for a lighter write path and did not find one that handles this table version.
+This is not a continuously running daemon. Each run processes one batch of changes and then exits. The demo shows a single execution of what would otherwise be a continuous loop. A production version would poll the timeline on a fixed interval and keep the checkpoint in durable storage rather than in memory.
 
-And it is not an in-place update. Because LanceDB has no way to update a vector, the sync deletes the old row and inserts a new one, which leaves a brief window where the changed record has no vector in the index at all. For a single-writer proof of concept that window does not matter, but it is the kind of thing that would need real handling under concurrent writes.
+It is also reliant on Spark. Hudi 1.0 writes a version 8 table, while alternative runtimes like `hudi-rs` and `Daft` currently support up to table version 6. That leaves PySpark as the only viable option for every write.
 
-The goal was a working proof of concept: keep a vector index consistent with a mutable Hudi table, without nightly rebuilds and without full table scans. That part works. The full code is on [GitHub](https://github.com/Pavan-249/lance-hudi).
+Lastly, it is not a true in-place update. Because LanceDB does not support updating a vector in place, the sync has to delete the old row and insert a new one. This leaves a brief window where the changed record has no vector in the index at all. For a single-writer proof of concept this is not a concern, but proper handling would be required for concurrent writers.
 
----
-
-# Assets to generate
-
-Everything below produces the images referenced in the post. Code snippets go through [carbon.now.sh](https://carbon.now.sh). Diagrams go through Lucidchart.
-
----
-
-## Snippet A: incremental query (carbon.now.sh)
-
-**Theme:** Night Owl | **Language:** Python | **Line numbers:** off | **Window chrome:** on | **Font:** JetBrains Mono 14px | **Padding:** 32px
-
-```python
-# Pull only the records written after the last checkpoint.
-# One Hudi primitive. No diff, no change table, no full scan.
-incr = (
-    spark.read.format("hudi")
-    .option("hoodie.datasource.query.type", "incremental")
-    .option("hoodie.datasource.read.begin.instanttime", checkpoint)
-    .load(HUDI_PATH)
-    .select("wine_id", "description", "_hoodie_commit_time")
-    .toPandas()
-)
-```
-
----
-
-## Snippet B: the resync (carbon.now.sh)
-
-**Same settings as Snippet A.**
-
-```python
-# Re-embed only the changed descriptions.
-vecs = model.encode(incr["description"].tolist(), convert_to_numpy=True)
-
-# LanceDB has no in-place update: delete the stale row, insert the fresh one.
-tbl.delete(f"wine_id = {wine_id}")
-tbl.add(pa.table({
-    "wine_id":     pa.array(incr["wine_id"].tolist(),     type=pa.int64()),
-    "description": pa.array(incr["description"].tolist(), type=pa.string()),
-    "vector":      pa.array(vecs.tolist(),                type=pa.list_(pa.float32(), 384)),
-}))
-```
-
----
-
-## Snippet C: demo terminal output (carbon.now.sh)
-
-**Theme:** One Dark | **Language:** plaintext | **Line numbers:** off | **Window chrome:** on (macOS style) | **Padding:** 32px
-
-```
-[INFO] Polling Hudi timeline for new commits...
-[DETECT] New commit detected: 20260602...
-[PULL] Executing Hudi incremental pull...
-[OK] 1 modified record fetched (0 full table scans)
-
-  Update detected: record 'wine_0'
-    - A bold red wine with dark cherry, blackberry and toasted oak...
-    + A crisp white wine with green apple, lemon zest and fresh herbs...
-
-[RESYNC] Initiating LanceDB resync
-    > generating 384-dim embedding for updated description
-    > DELETE id 'wine_0' from vector index
-    > INSERT new embedding for id 'wine_0' into vector index
-[OK] Resync completed in 0.34s
-
-[VERIFY] System verification
-    > search(query="crisp white wine green apple lemon zest mineral")
-    > top match: wine_0  distance: 0.145  (index healthy)
-```
-
----
-
-## Diagram 1: two-store architecture (Lucidchart)
-
-**Style reference:** the Lance vs Iceberg side-by-side diagram from lancedb.com/blog. Two panels with dashed outer borders, inner nested boxes, clean sans-serif labels.
-
-**Layout:** two panels side by side, equal width, separated by a vertical gap containing the sync arrow.
-
-**Left panel** — outer dashed border, title "Apache Hudi" (bold, top-left), accent color #FF6B35 (Hudi orange).
-Inside, three nested boxes stacked vertically:
-1. Box labeled ".hoodie/ Timeline" — contains three small pill shapes in a row: `20260601...` `20260602...` `20260602...` (representing commit timestamps)
-2. Box labeled "Parquet Data Files" — three small overlapping file icons with "country / variety / points / description" as a caption underneath
-3. Box labeled "Metadata" — single line: "hoodie.properties, schema"
-
-**Right panel** — outer dashed border, title "LanceDB" (bold, top-left), accent color #1A6FFF (LanceDB blue).
-Inside, three nested boxes stacked vertically:
-1. Box labeled "Fragment Files (.lance)" — three small overlapping file icons with "wine_id / vector[384] / description" caption
-2. Box labeled "IVF-PQ Vector Index" — a small grid representing the ANN index structure
-3. Box labeled "Metadata JSON" — single line: "schema, index config"
-
-**Center connector:** a bold horizontal arrow pointing right from the Hudi panel to the LanceDB panel.
-Label on arrow (centered, bold): `03_demo_sync.py`
-Below arrow label, three stacked step lines in smaller text:
-```
-1. incremental pull
-2. re-embed changed rows
-3. delete + insert
-```
-
-**Bottom caption** (centered, below both panels): "Hudi is the source of truth. LanceDB is the derived index."
-
----
-
-## Diagram 2: Hudi commit timeline (Lucidchart)
-
-**Purpose:** visualize how the incremental query primitive works. Appears under the "Why Hudi" section.
-
-**Layout:** horizontal timeline bar across the full width of the diagram.
-
-**Timeline bar:** a thick horizontal line labeled "Hudi Commit Timeline" on the left end.
-
-**Commits:** five circular markers on the timeline, left to right.
-- C1, C2: filled grey circles (old commits, already processed)
-- C3: filled orange circle labeled "checkpoint" with a small flag icon below it
-- C4, C5: filled blue circles (new commits, not yet processed)
-
-**Incremental query window:** a light blue shaded rectangle spanning from C3 to C5, with a bracket above it labeled "incremental query window" in blue.
-
-**Records box:** below C4 and C5, draw two downward arrows pointing into a box labeled "Changed records returned" with two rows inside: `wine_0 (description updated)` and `wine_47 (price updated)`.
-
-**Exclusion note:** below C1 and C2, a greyed-out note: "C1, C2 already processed — not re-embedded"
-
-**Caption** (below everything): "Cost scales with the size of the change, not the size of the table."
-
----
-
-## Diagram 3: future state, RFC-100 + RFC-102 (Lucidchart)
-
-**Purpose:** show that the two-store architecture collapses into one once the RFCs land.
-
-**Layout:** one large single box, centered. Above it, a smaller "before" reference.
-
-**Before reference** (top, small, faded): a miniaturized version of Diagram 1 — two small boxes (Hudi + LanceDB) connected by an arrow, with an "X" over the arrow labeled "sync script". A large downward-pointing arrow labeled "RFC-100 + RFC-102" transitions from this into the main box below.
-
-**Main box** — outer solid border, title "Apache Hudi" (bold, large), accent color #FF6B35.
-Inside, four horizontally full-width rows:
-
-| Row | Label | Color |
-|-----|-------|-------|
-| 1 | Lance File Format (RFC-100) | blue accent, highlighted |
-| 2 | Native Vector Search (RFC-102) | blue accent, highlighted |
-| 3 | Parquet / ORC (existing formats) | grey, dimmed |
-| 4 | Unified Table: structured fields + vector column | white, bold |
-
-Inside Row 4, two sub-columns: "country / variety / points / price / description" on the left, "vector [384-dim]" on the right, with a small separator line between them.
-
-**Caption** (below box): "No sync script. No second store. Vectors live inside the table."
-
-**RFC badges:** two small pill badges to the right of the box title: `RFC-100` and `RFC-102`, each linked to the GitHub issue.
+The goal was to build a working proof of concept to keep a vector index consistent with a mutable Hudi table, without nightly rebuilds and without full table scans. That mechanism works exceptionally well. The full code is on [GitHub](https://github.com/Pavan-249/lance-hudi).
