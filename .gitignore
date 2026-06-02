@@ -1,0 +1,11 @@
+jars/
+venv/
+__pycache__/
+*.pyc
+.DS_Store
+spark-warehouse/
+hudi_table/
+lance_db/
+data/
+*.egg-info/
+.ipynb_checkpoints/
