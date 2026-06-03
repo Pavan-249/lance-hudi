@@ -55,7 +55,7 @@ The first script (`01_ingest_hudi.py`) reads the wine reviews CSV and writes all
 
 ## How the sync works
 
-The mechanism is straightforward. Hudi stamps every write with a commit timestamp. The sync script maintains a checkpoint, which is simply the last commit timestamp it managed to process. On each run, it queries Hudi for everything committed after that checkpoint, re-embeds the descriptions for whatever rows are returned, and then updates LanceDB one record at a time. After that, it saves the new commit timestamp as the next checkpoint. The following run starts from there, ensuring no commit is ever processed twice and nothing gets missed.
+The mechanism is straightforward. Hudi stamps every data write with a commit timestamp, and the sync script stores its checkpoint in Hudi commit metadata. That checkpoint records the last Hudi data commit LanceDB has processed. On each run, it queries Hudi for everything committed after that checkpoint, re-embeds the descriptions for whatever rows are returned, and then updates LanceDB one record at a time. Only after the LanceDB update and semantic-search verification succeed does it save the latest processed Hudi data commit as the next checkpoint. The following run starts from there, ensuring no commit is ever processed twice and nothing gets missed.
 
 The actual update in LanceDB requires a delete followed by an insert. This is a current constraint of LanceDB. Since there is no in-place vector update API, the only way to replace an embedding is to remove the old row by its ID and then add the new one.
 
@@ -67,11 +67,11 @@ The demo targets a record `wine_0`, rewrites its description from a bold red win
 
 ![Demo terminal output showing the sync in action](/images/blog/lance-hudi-demo.png)
 
-The incremental pull returns exactly one modified record and executes zero full table scans to find it. The stale vector gets deleted, the fresh embedding is inserted, and a subsequent search for "crisp white wine green apple lemon zest mineral" returns `wine_0` at the top with a low distance score. The index finishes completely consistent with Hudi, without ever needing a full rebuild.
+The incremental pull returns exactly one modified record and executes zero full table scans to find it. The stale vector gets deleted, the fresh embedding is inserted, and a subsequent search for "crisp white wine green apple lemon zest mineral" returns `wine_0` at the top with a low distance score. A final poll returns 0 new records, and the index finishes completely consistent with Hudi, without ever needing a full rebuild.
 
 ## What is next
 
-It is worth noting that this two-store architecture is essentially a bridge. The primary reason a sync script needs to exist is that the vectors live in a separate store from the table they describe. Two upcoming RFCs in the Apache Hudi project are aimed directly at closing that gap.
+This two-store architecture is essentially a bridge. The primary reason a sync script needs to exist is that the vectors live in a separate store from the table they describe. Two upcoming RFCs in the Apache Hudi project are aimed directly at closing that gap.
 
 [RFC-100](https://github.com/apache/hudi/issues/14127) introduces Lance as a first-class file format inside Hudi, allowing vectors to sit directly in the same table as structured fields. [RFC-102](https://github.com/apache/hudi/issues/14219) adds native vector similarity search directly on Hudi tables.
 
@@ -81,9 +81,9 @@ Once both capabilities land, the secondary store will stop being necessary altog
 
 ## What this is not
 
-A few points are worth clarifying regarding the scope of this project.
+There are a few key limitations regarding the scope of this project.
 
-This is not a continuously running daemon. Each run processes one batch of changes and then exits. The demo shows a single execution of what would otherwise be a continuous loop. A production version would poll the timeline on a fixed interval and keep the checkpoint in durable storage rather than in memory.
+This is not a continuously running daemon. Each run processes one batch of changes and then exits. The demo shows a single execution of what would otherwise be a continuous loop. A production version would poll the timeline on a fixed interval and use the same Hudi commit-metadata checkpoint between runs.
 
 It is also reliant on Spark. Hudi 1.0 writes a version 8 table, while alternative runtimes like `hudi-rs` and `Daft` currently support up to table version 6. That leaves PySpark as the only viable option for every write.
 
