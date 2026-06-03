@@ -9,5 +9,6 @@ lance_db/
 data/
 *.egg-info/
 .ipynb_checkpoints/
-scripts 2.zip
-.gitignore
+*.zip
+scripts/spark-warehouse/
+HANDOFF.md

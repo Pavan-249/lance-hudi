@@ -75,11 +75,12 @@ Dataset: download `winemag-data-130k-v2.csv` from Kaggle and place it at `data/w
 python scripts/01_ingest_hudi.py  # reads the CSV and writes 130k records to a Hudi COW table
 python scripts/02_embed_lance.py  # reads the Hudi snapshot, embeds all descriptions with all-MiniLM-L6-v2, writes to LanceDB
 python scripts/03_demo_sync.py    # mutates a record in Hudi, detects it via incremental pull, resyncs LanceDB, verifies with semantic search
+python scripts/04_poll.py         # confirms there are 0 new records immediately after sync
 ```
 
 ## How the sync works
 
-Hudi stamps every write with a commit timestamp on its timeline. The sync reads a checkpoint: the last commit it processed. It runs an incremental query that returns only records committed after that timestamp. For each changed record, it re-embeds the new description. It then deletes the stale vector from LanceDB by record ID and inserts the fresh embedding. Finally, it saves the new commit timestamp as the next checkpoint. The next run picks up from there. Only records that changed are touched.
+Hudi stamps every data write with a commit timestamp on its timeline. The initial full embed writes a Hudi commit-metadata checkpoint under `lance.sync.bookmark`, recording the latest Hudi data commit LanceDB has processed. The sync reads that bookmark value, runs an incremental query for records committed after it, and re-embeds each changed description. It then deletes the stale vector from LanceDB by record ID and inserts the fresh embedding. Only after the update and semantic-search verification succeed does it save the latest processed Hudi data commit as the next bookmark. `04_poll.py` is the final sanity check: immediately after sync, it should return 0 new records and report LanceDB is in sync. Only records that changed are touched.
 
 ## Why Hudi
 
